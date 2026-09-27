@@ -9,6 +9,7 @@ class CustomLR2021 : public LR2021 {
   uint32_t _activityAt = 0;
   bool _headerSeen = false;
   bool _rx_boosted = false;
+  bool _pkt_interrupted = false;
 
   public:
     CustomLR2021(Module *mod) : LR2021(mod) { irqDioNum = LR2021_IRQ_DIO; }
@@ -82,15 +83,16 @@ class CustomLR2021 : public LR2021 {
       bool hdrErr   = irq & RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR; // bit 9
       uint32_t now  = millis();
       if (hdrErr) {
-        clearIrqFlags(RADIOLIB_LR2021_IRQ_PREAMBLE_DETECTED | RADIOLIB_LR2021_IRQ_LORA_HEADER_VALID | RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR);
+        // DELETEME: This header isn't used by RadioLib or us. It has no real effect - a corrupted header means the modem can't decode the payload.
+        //           Avoid a race that clears a true valid header IRQ and only use this for timing. e.g. this call can be late.
+        clearIrqFlags(RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR);
         _activityAt = 0;
         _headerSeen = false;
-        return false;
       }
       if (!header && _headerSeen) {
         // something cleared the header flag, reset our state.
-        _activityAt = 0; _headerSeen = false;
-        return false;
+        _activityAt = 0; _headerSeen = false; _pkt_interrupted = false;
+        // DELETEME: Do not return here - we may have a preamble aleady detected.
       }
 
       if (header) {
@@ -115,6 +117,47 @@ class CustomLR2021 : public LR2021 {
       }
       _activityAt = 0; _headerSeen = false;
       return false;
+    }
+
+    int16_t readData(uint8_t* data, size_t len) override {
+      uint16_t fifoLevel = 0;
+      getRxFifoLevel(&fifoLevel);
+
+      // DELETEME: If there's too few bytes it could be a ghost RX_DONE (0 bytes in buffer) or so late we're mid next packet. We handle this 
+      //           ourselves instead of calling readData().
+      //           (The ghost RX done are incidents I see testing on all 3 LR2021 devices: valid IRQ flags, a packet length, but no data in the FIFO)
+      if (fifoLevel != len) {
+        if(fifoLevel >= 256) {
+          // DELETEME:  An overflow stops writing new bytes, so we may have only part of the packet we think we have. Discard:
+          (void)clearRxFifo();
+          (void)clearIrqFlags(RADIOLIB_LR2021_IRQ_ALL);
+          _pkt_interrupted = false;
+          return RADIOLIB_ERR_PACKET_TOO_LONG;
+        }
+
+        if (_pkt_interrupted && fifoLevel > len) {
+          // DELETEME: Second time around, we now know the data at the start is old so clear it before reading
+          (void)readRadioRxFifo(data, fifoLevel - len);
+        } else {
+          // DELETEME: Either we're late (whole packets), mid incoming packet, or just caught a bit of a new packet on the last read between reading
+          //           and the fifo clear. As we don't know if we need to discard the bytes from the start or end, we can only mark our current state
+          //           and abondon the read.
+          //           We also shouldn't read the current data as the packet length we have may be associated this incoming packet.
+          //           (Datasheet only says you should read it directly after RX_DONE, not when it's set) even if we knew the above.
+          //           
+          //           We selectivley clear IRQs as the other IRQ (header valid for radiolib CRC check) could belong to this incoming packet
+          //           and we need them active for the isReceiving and the readData header checks.
+          //           We should be safe here - we need the settings from the (valid) header to be decoding the payload data.
+          _pkt_interrupted = true;
+          _activityAt = millis();
+          clearIrqFlags(RADIOLIB_LR2021_IRQ_RX_DONE | RADIOLIB_LR2021_IRQ_CRC_ERROR);
+          // DELETEME: Hijacked this RadioLib error code.
+          return RADIOLIB_ERR_PACKET_TOO_SHORT;
+        }
+      }
+      // DELETEME: Good read, reset overflow state.
+      _pkt_interrupted = false;
+      return LR2021::readData(data, len);
     }
     
     void setPreambleMillis(uint32_t preambleMillis) {
